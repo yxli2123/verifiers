@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "multi-turn-constraints"
+version = "0.1.0"
+description = "Multi-turn RL environment with constraint verifiers"
+requires-python = ">=3.11"
+dependencies = [
+    "verifiers",
+    "datasets",
+]
+
+[project.optional-dependencies]
+train = [
+    "transformers",
+]
+
+[tool.hatch.build]
+include = [
+    "multi_turn_constraints.py",
+    "README.md",
+    "pyproject.toml",
+]
+
+[tool.verifiers.eval]
+num_examples = 5
+rollouts_per_example = 4
