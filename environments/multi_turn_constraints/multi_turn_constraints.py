@@ -1,206 +1,314 @@
 """Multi-turn RL environment with constraint-based verification."""
 
-from __future__ import annotations
+import asyncio
+import builtins
+import inspect
+import logging
+from collections import defaultdict
+from typing import (
+    Any,
+    Mapping,
+    Sequence,
+    TypedDict,
+    List,
+    Literal,
+    Dict,
+    Tuple,
+)
 
-from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Sequence, TypedDict
-
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import load_dataset
 
 import verifiers as vf
-from verifiers.types import ChatMessage, Info, Messages, State
-from verifiers.utils.async_utils import maybe_await
+
+import signal
+import functools
+
+ALPHA = 2
 
 
-class ConstraintTurn(TypedDict):
+# ----- Define Types -----
+class Message(TypedDict):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class VerifierPtr(TypedDict):
     """Metadata for a single turn's constraint configuration."""
 
     constraint_ids: Sequence[str]
     statuses: Sequence[str]
+    placeholders: Sequence[str]
 
 
-ConstraintVerifier = Callable[..., bool | Awaitable[bool]]
+class Verifier(TypedDict):
+    """Metadata for a single verifier."""
+
+    func: str
+    placeholder: str
+    constraint_id: str
+    result: bool | None
 
 
-def _normalize_chat_message(message: Mapping[str, Any]) -> ChatMessage:
-    """Ensure each chat message contains the required fields."""
+class Constraint(TypedDict):
+    """Metadata for a single constraint."""
 
-    if "role" not in message or "content" not in message:
-        raise ValueError(
-            "Each message must contain 'role' and 'content' keys for chat formatting."
-        )
-    role = str(message["role"]).strip()
-    content = str(message["content"])
-    if not role:
-        raise ValueError("Message role cannot be empty.")
-    return {"role": role, "content": content}
+    id: str
+    constraint: str
+    func: Sequence[str]
+
+    verifier_type: str
+    type: str
+    description: str
+    content_template: bool
+    verifier_prompt: str
 
 
-def _prepare_example(example: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
+class State(TypedDict):
+    prompt: List[Message]
+    completion: List[Message] | None
+    answer: str | None
+    task: str | None
+    info: Dict[str, Any] | None
+    example_id: int | None
+    responses: List[Any]
+    turn: int  # init 0, + 1 after calling rollout
+    timing: Dict[Literal["generation_ms", "scoring_ms", "total_ms"], float]
+
+
+class Info(TypedDict):
+    follow_up_messages: List[Message]
+    verifiers: List[VerifierPtr]
+    total_turns: int
+
+
+class MultiTurnInstance(TypedDict):
+    """Metadata for a single multi-turn data."""
+
+    prompt: List[Message]
+    follow_up_messages: List[Message]
+    verifiers: List[VerifierPtr]
+    total_turns: int
+
+
+class MultiTurnTrainingInstance(TypedDict):
+    """Metadata for a single multi-turn training data in `verifiers` style (schema)."""
+
+    prompt: List[Message]
+    completion: List[Message] | None
+    answer: str | None
+    task: str | None
+    info: Info | None
+    example_id: int | None
+
+
+class SingleVerification(TypedDict):
+    pass_rate: float
+    constraint_id: str
+
+
+# ----- Helper functions -----
+def _prepare_example(example: MultiTurnInstance) -> MultiTurnTrainingInstance:
     """Convert a raw dataset example into the format expected by the environment."""
 
-    prompts = example.get("prompt")
-    if not isinstance(prompts, list) or not prompts:
-        raise ValueError(
-            "Expected the dataset to provide a non-empty list of chat prompts per example."
-        )
-    chat_prompts = [_normalize_chat_message(message) for message in prompts]
-
-    constraint_ids = example.get("constraint_id", [])
-    constraint_status = example.get("constraint_status", [])
-    if len(constraint_ids) != len(constraint_status):
-        raise ValueError(
-            "`constraint_id` and `constraint_status` must have the same number of turns."
-        )
-    if len(chat_prompts) != len(constraint_ids):
-        raise ValueError(
-            "The number of chat prompts must match the number of constraint turns."
-        )
-
-    turn_constraints: list[ConstraintTurn] = []
-    for ids, statuses in zip(constraint_ids, constraint_status):
-        if not isinstance(ids, list) or not isinstance(statuses, list):
-            raise ValueError(
-                "Each constraint turn must be represented as a list of ids and statuses."
-            )
-        normalized_statuses = [str(status).lower() for status in statuses]
-        turn_constraints.append(
-            {
-                "constraint_ids": [str(constraint_id) for constraint_id in ids],
-                "statuses": normalized_statuses,
-            }
-        )
-
-    follow_up_messages = chat_prompts[1:]
-    example["prompt"] = [chat_prompts[0]]
-    example.setdefault("answer", "")
-    example.setdefault("task", "multi-turn-constraints")
-    example["info"] = {
-        "follow_up_messages": follow_up_messages,
-        "turn_constraints": turn_constraints,
-        "total_turns": len(turn_constraints),
+    training_example: MultiTurnTrainingInstance = {
+        "prompt": example["prompt"],
+        "answer": "",
+        "task": "multi-turn-instruction-following",
+        "info": {
+            "follow_up_messages": example["follow_up_messages"],
+            "verifiers": example["verifiers"],
+            "total_turns": example["total_turns"],
+        },
+        "completion": None,
+        "example_id": None,
     }
-    return example
+
+    return training_example
 
 
-async def _verify_turn(
-    *,
-    verifier: ConstraintVerifier,
-    response_text: str,
-    turn_index: int,
-    conversation: list[ChatMessage],
-    state: State,
-    info: Info,
-    constraint_id: str,
-) -> bool:
-    return bool(
-        await maybe_await(
-            verifier,
-            response=response_text,
-            turn_index=turn_index,
-            messages=conversation,
-            state=state,
-            info=info,
-            constraint_id=constraint_id,
-        )
-    )
+def timeout(seconds: float):
+    """Raise TimeoutError if the wrapped function runs longer than `seconds`.
+    Unix-only (posix). Must be called from the main thread.
+    """
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if not hasattr(signal, "SIGALRM"):
+                raise RuntimeError("signal-based timeout requires Unix (SIGALRM).")
+
+            def _handle_alarm(signum, frame):
+                raise TimeoutError(f"{func.__name__} timed out after {seconds} seconds")
+
+            old_handler = signal.getsignal(signal.SIGALRM)
+            try:
+                signal.signal(signal.SIGALRM, _handle_alarm)
+                # setitimer supports fractional seconds
+                signal.setitimer(signal.ITIMER_REAL, seconds)
+                return func(*args, **kwargs)
+            finally:
+                # always clean up timer & restore handler
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                signal.signal(signal.SIGALRM, old_handler)
+
+        return wrapper
+
+    return decorator
 
 
-async def _verify_rollout(
-    *,
-    verifier_pool: Mapping[str, ConstraintVerifier],
-    prompt: Messages,
-    completion: Messages,
-    state: State,
-    info: Info,
-) -> bool:
-    if not isinstance(prompt, list) or not isinstance(completion, list):
-        raise TypeError("Multi-turn constraint environment expects chat-formatted messages.")
+@timeout(5.0)
+def _execute_function(
+    func_src: str,
+    args: dict[str, Any],
+    func_name: str = "evaluate",
+) -> Any:
+    """
+    Compile `func_src`, locate the function `func_name` (or the first function defined),
+    and call it with kwargs from `args`. Extra keys in `args` are ignored.
+    Supports both def and async def.
+    """
 
-    turn_constraints: Sequence[ConstraintTurn] = info.get("turn_constraints", [])  # type: ignore[assignment]
-    total_turns = info.get("total_turns", len(turn_constraints))
-    if total_turns != len(turn_constraints):
-        raise ValueError("Mismatch between total_turns and provided constraint metadata.")
-    if total_turns == 0:
-        return False
+    # Give user code full access to Python builtins (HIGH RISK).
+    # This includes `__import__`, so `import ...` inside func_src will work.
+    g: dict[str, Any] = {"__builtins__": builtins}
 
-    conversation_prefix: list[ChatMessage] = list(prompt)
-    verified_turns = 0
-    for message in completion:
-        if not isinstance(message, dict):
-            raise TypeError("Each completion message must be a mapping for chat format.")
-        conversation_prefix.append(message)  # conversation so far including current message
-        if message.get("role") != "assistant":
-            continue
-        if verified_turns >= total_turns:
-            break
-        turn = turn_constraints[verified_turns]
-        if len(turn["constraint_ids"]) != len(turn["statuses"]):
-            raise ValueError("Constraint ids and statuses must align for each turn.")
-        response_text = str(message.get("content", ""))
-        for constraint_id, status in zip(turn["constraint_ids"], turn["statuses"]):
-            if status != "enabled":
-                continue
-            verifier = verifier_pool.get(constraint_id)
-            if verifier is None:
-                raise KeyError(
-                    f"No verifier registered for constraint id '{constraint_id}'."
-                )
-            is_valid = await _verify_turn(
-                verifier=verifier,
-                response_text=response_text,
-                turn_index=verified_turns,
-                conversation=list(conversation_prefix),
-                state=state,
-                info=info,
-                constraint_id=constraint_id,
-            )
-            if not is_valid:
-                return False
-        verified_turns += 1
-    return verified_turns >= total_turns
+    code = compile(func_src, filename="<user_function>", mode="exec")
+    exec(code, g, g)
+
+    if func_name not in g or not callable(g[func_name]):
+        raise ValueError(f"Function '{func_name}' not found after compiling source.")
+
+    fn = g[func_name]
+
+    # Filter kwargs to the function signature
+    sig = inspect.signature(fn)
+    filtered = {k: v for k, v in args.items() if k in sig.parameters}
+    sig.bind(**filtered)  # raises if required args are missing
+
+    # Call (await if coroutine)
+    if inspect.iscoroutinefunction(fn):
+        return asyncio.run(fn(**filtered))
+
+    return fn(**filtered)
 
 
+# ----- Define Environment -----
 class MultiTurnConstraintEnv(vf.MultiTurnEnv):
     """Multi-turn environment that enforces per-turn constraint verifiers."""
 
-    def __init__(
-        self,
-        *,
-        verifier_pool: Mapping[str, ConstraintVerifier],
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(**kwargs)
-        self.verifier_pool = dict(verifier_pool)
-
-    async def setup_state(self, state: State, **kwargs: Any) -> State:  # noqa: D401
-        state = await super().setup_state(state, **kwargs)
-        info = state.setdefault("info", {})
-        if "turn_constraints" not in info:
-            info["turn_constraints"] = []
-        if "follow_up_messages" not in info:
-            info["follow_up_messages"] = []
-        info.setdefault("total_turns", len(info.get("turn_constraints", [])))
-        return state
-
-    async def is_completed(self, messages: Messages, state: State, **kwargs: Any) -> bool:
+    async def is_completed(
+        self, messages: List[Message], state: State, **kwargs: Any
+    ) -> bool:
         base_completed = await super().is_completed(messages, state, **kwargs)
         if base_completed:
             return True
-        info = state.get("info", {})
-        total_turns = info.get("total_turns", 0)
+        total_turns = state["info"]["total_turns"]
         return state["turn"] >= total_turns
 
     async def env_response(
-        self, messages: Messages, state: State, **kwargs: Any
-    ) -> tuple[Messages, State]:
-        follow_ups: Sequence[ChatMessage] = state.get("info", {}).get(
-            "follow_up_messages", []
-        )
-        next_index = state["turn"] - 1
-        if 0 <= next_index < len(follow_ups):
-            next_message = follow_ups[next_index]
+        self, messages: List[Message], state: State, **kwargs: Any
+    ) -> tuple[List[Message], State]:
+        """Add a follow-up message (constraint) after each rollout."""
+        follow_up_messages: List[Message] = state["info"]["follow_up_messages"]
+
+        # Follow-up messages indexing from 0 and state["turn"] = 1, after the 1st rollout.
+        follow_up_msg_idx = state["turn"] - 1
+        if 0 <= follow_up_msg_idx < len(follow_up_messages):
+            next_message = follow_up_messages[follow_up_msg_idx]
             return [next_message], state
         return [], state
+
+
+# ----- Define Rubrics: Verifiers and Reward -----
+def verify_single_turn(
+    *,
+    verifier_ptr: VerifierPtr,
+    response: str,
+    constraint_pool: Mapping[str, Constraint],
+) -> Tuple[bool, List[SingleVerification]]:
+    verifiers: List[Verifier] = []
+
+    constraint_ids = verifier_ptr["constraint_ids"]
+    statuses = verifier_ptr["statuses"]
+    placeholders = verifier_ptr["placeholders"]
+    for c_id, status, placeholder in zip(constraint_ids, statuses, placeholders):
+        funcs = constraint_pool[c_id]["func"]
+        if status == "enabled":
+            for func in funcs:
+                _verifier: Verifier = {
+                    "func": func,
+                    "placeholder": placeholder,
+                    "constraint_id": c_id,
+                    "result": None,
+                }
+                verifiers.append(_verifier)
+
+    for _verifier in verifiers:
+        # If placeholder != "", pass the placeholder to the verifier function.
+        if _verifier["placeholder"]:
+            args = {"response": response, "placeholder": _verifier["placeholder"]}
+        else:
+            args = {"response": response}
+        result = _execute_function(_verifier["func"], args)
+
+        # TODO: Return False early.
+        # if return_early and not bool(result):
+        #     return False, verifiers
+
+        _verifier.setdefault("result", result)
+
+    final_result = all(ver["result"] for ver in verifiers)
+
+    pass_flags = defaultdict(list)
+    for _verifier in verifiers:
+        pass_flags[_verifier["constraint_id"]].append(1 if _verifier["result"] else 0)
+
+    verification: List[SingleVerification] = []
+    for c_id, flag in pass_flags.items():
+        s_ver: SingleVerification = {
+            "pass_rate": sum(flag) / len(flag) if len(flag) else 0.0,
+            "constraint_id": c_id,
+        }
+        verification.append(s_ver)
+
+    return final_result, verification
+
+
+def verify_multi_turn(
+    *,
+    prompt: List[Message],
+    completion: List[Message],
+    state: State,
+    info: Info,
+    constraint_pool: Mapping[str, Constraint],
+) -> Tuple[List[bool | None], List[List[SingleVerification] | None]]:
+    total_turns = info["total_turns"]
+    verifiers = info["verifiers"]
+    verified_result: List[bool | None] = [None] * total_turns
+    verifier_log: List[List[SingleVerification] | None] = [None] * total_turns
+
+    # Obtain responses from all turns.
+    responses = []
+    for conversation in completion:
+        if conversation["role"] == "assistant":
+            responses.append(conversation["content"])
+
+    if len(responses) < total_turns:
+        logging.error(
+            f"Conversation has {len(responses)} turns less than expected {total_turns} turns."
+        )
+        return verified_result, verifier_log
+
+    for i, response, verifier in zip(range(total_turns), responses, verifiers):
+        passed, log_verifier = verify_single_turn(
+            verifier_ptr=verifier,
+            response=response,
+            constraint_pool=constraint_pool,
+        )
+        verified_result[i] = passed
+        verifier_log[i] = log_verifier
+
+    return verified_result, verifier_log
 
 
 async def placeholder_verifier(**_: Any) -> bool:
@@ -209,64 +317,58 @@ async def placeholder_verifier(**_: Any) -> bool:
     raise NotImplementedError("Provide a task-specific verifier implementation.")
 
 
-def _prepare_dataset(dataset: Dataset | DatasetDict) -> Dataset:
-    """Normalize the dataset structure regardless of whether a split dict is provided."""
-
-    if isinstance(dataset, DatasetDict):
-        if "train" not in dataset:
-            raise ValueError("DatasetDict must contain a 'train' split for training.")
-        dataset = dataset["train"]
-    return dataset.map(_prepare_example)
-
-
 def load_environment(
-    dataset_name: str | None = None,
-    *,
-    dataset_split: str = "train",
-    dataset_config: str | None = None,
-    dataset: Dataset | DatasetDict | None = None,
-    verifier_pool: Mapping[str, ConstraintVerifier] | None = None,
-    max_turns: int = -1,
+    *dataset_path: str,
+    constraint_path: str = "yxli2123/verifiable-constraints",
+    max_turns: int = 8,
     **kwargs: Any,
 ) -> vf.Environment:
     """Load the multi-turn constraint environment."""
 
-    if dataset is None:
-        if dataset_name is None:
-            raise ValueError("Either a dataset or dataset_name must be provided.")
-        dataset = load_dataset(dataset_name, dataset_config, split=dataset_split)  # type: ignore[arg-type]
-    prepared_dataset = _prepare_dataset(dataset)
+    dataset = load_dataset(dataset_path, split="train")  # type: ignore[arg-type]
+    prepared_dataset = _prepare_example(dataset)
 
-    if verifier_pool is None:
-        raise ValueError(
-            "verifier_pool must be provided. Use `placeholder_verifier` as a template for your implementation."
-        )
+    constraint_pool: List[Constraint] = load_dataset(constraint_path, split="train")
+    indexed_constraint = {c["id"]: c for c in constraint_pool}
 
     parser = vf.Parser()
 
-    async def constraint_reward(
-        prompt: Messages,
-        completion: Messages,
+    async def reward_func(
+        prompt: List[Message],
+        completion: List[Message],
         state: State,
         info: Info,
         **_: Any,
     ) -> float:
-        passed = await _verify_rollout(
-            verifier_pool=verifier_pool,
+        reward = 0.0
+        ver_result, ver_log = verify_multi_turn(
             prompt=prompt,
             completion=completion,
             state=state,
             info=info,
+            constraint_pool=indexed_constraint,
         )
-        return 1.0 if passed else 0.0
 
-    rubric = vf.Rubric(parser=parser, funcs=[constraint_reward])
+        # Progress reward.
+        for passed in ver_result:
+            if passed:
+                reward += 1.0 / len(ver_result)
+            else:
+                # No reward for all following turns, even if they are correct.
+                break
+
+        # All turns are correct. Give more reward if the turns are long.
+        if all(ver_result):
+            reward += 1 * ALPHA ** len(ver_result)
+
+        return reward
+
+    rubric = vf.Rubric(parser=parser, funcs=[reward_func])
 
     environment = MultiTurnConstraintEnv(
         dataset=prepared_dataset,
         parser=parser,
         rubric=rubric,
-        verifier_pool=verifier_pool,
         max_turns=max_turns,
         **kwargs,
     )
