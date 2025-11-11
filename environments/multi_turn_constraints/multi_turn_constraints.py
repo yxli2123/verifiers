@@ -250,7 +250,12 @@ def verify_single_turn(
             args = {"response": response, "placeholder": _verifier["placeholder"]}
         else:
             args = {"response": response}
-        result = _execute_function(_verifier["func"], args)
+
+        try:
+            result = _execute_function(_verifier["func"], args)
+        except Exception as e:
+            logging.error(f"Error calling verifier: {e}")
+            result = False
 
         # TODO: Return False early.
         # if return_early and not bool(result):
@@ -277,9 +282,7 @@ def verify_single_turn(
 
 def verify_multi_turn(
     *,
-    prompt: List[Message],
     completion: List[Message],
-    state: State,
     info: Info,
     constraint_pool: Mapping[str, Constraint],
 ) -> Tuple[List[bool | None], List[List[SingleVerification] | None]]:
@@ -338,9 +341,7 @@ def load_environment(
     ) -> float:
         reward = 0.0
         ver_result, ver_log = verify_multi_turn(
-            prompt=prompt,
             completion=completion,
-            state=state,
             info=info,
             constraint_pool=indexed_constraint,
         )
@@ -372,6 +373,25 @@ def load_environment(
 
 
 # ----- Test -----
+def test_timeout():
+    func_src = """
+def evaluate(response: str) -> bool:
+    cnt = 0
+    while True:
+        cnt += 2
+    return True
+    """
+    args = {
+        "response": "random input text.",
+    }
+    try:
+        _ = _execute_function(func_src, args)
+    except TimeoutError:
+        return True
+
+    raise RuntimeError("Timeout test not passed.")
+
+
 if __name__ == "__main__":
     env = load_environment()
     client = OpenAI()
