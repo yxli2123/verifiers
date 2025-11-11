@@ -17,6 +17,7 @@ from typing import (
 )
 
 from datasets import load_dataset
+from openai import OpenAI
 
 import verifiers as vf
 
@@ -255,7 +256,7 @@ def verify_single_turn(
         # if return_early and not bool(result):
         #     return False, verifiers
 
-        _verifier.setdefault("result", result)
+        _verifier["result"] = result
 
     final_result = all(ver["result"] for ver in verifiers)
 
@@ -311,14 +312,8 @@ def verify_multi_turn(
     return verified_result, verifier_log
 
 
-async def placeholder_verifier(**_: Any) -> bool:
-    """Placeholder verifier implementation. Replace with task-specific logic."""
-
-    raise NotImplementedError("Provide a task-specific verifier implementation.")
-
-
 def load_environment(
-    *dataset_path: str,
+    dataset_path: str = "yxli2123/multi-turn-v1",
     constraint_path: str = "yxli2123/verifiable-constraints",
     max_turns: int = 8,
     **kwargs: Any,
@@ -326,9 +321,10 @@ def load_environment(
     """Load the multi-turn constraint environment."""
 
     dataset = load_dataset(dataset_path, split="train")  # type: ignore[arg-type]
-    prepared_dataset = _prepare_example(dataset)
+    dataset = dataset.shuffle()
+    prepared_dataset = dataset.map(_prepare_example)
 
-    constraint_pool: List[Constraint] = load_dataset(constraint_path, split="train")
+    constraint_pool: List[Constraint] = load_dataset(constraint_path, split="train")  # type: ignore[arg-type]
     indexed_constraint = {c["id"]: c for c in constraint_pool}
 
     parser = vf.Parser()
@@ -373,3 +369,24 @@ def load_environment(
         **kwargs,
     )
     return environment
+
+
+# ----- Test -----
+if __name__ == "__main__":
+    env = load_environment()
+    client = OpenAI()
+    results = env.evaluate_sync(
+        client=client,
+        model="gpt-4.1-mini",
+        num_examples=1,
+        rollouts_per_example=2,
+        max_concurrent=32,
+        save_every=10,
+    )
+    prompt = results.prompt
+    completion = results.completion
+    reward = results.reward
+    for p, c, r in zip(prompt, completion, reward):
+        print(p)
+        print(c)
+        print(r)
