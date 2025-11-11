@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "verifiers"
+name = "verifiers_clone"
 authors = [
     {name = "William Brown", email = "williambrown97@gmail.com"},
 ]
